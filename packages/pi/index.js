@@ -1,6 +1,7 @@
 import codexPaceStatus from "./extensions/codex-pace-status.js";
 import deepseekPriceStatus from "./extensions/deepseek-price-status.js";
 import glmPriceStatus from "./extensions/glm-price-status.js";
+import registerSubagentWatchdog from "./extensions/subagent-watchdog-lifecycle.js";
 
 export const PI_STATUS_PROFILES = Object.freeze({
   hybrid: deepseekPriceStatus,
@@ -14,6 +15,7 @@ export function statusExtensionForProfile(profile) {
 }
 
 export default function harnessStatusExtension(pi) {
+  registerSubagentWatchdog(pi);
   const profile = process.env.AGENT_ORCHESTRATION_PROFILE;
   const extension = statusExtensionForProfile(profile);
   if (extension) extension(pi);

@@ -25,20 +25,41 @@ test("profile dispatch selects exactly one native Pi status extension", () => {
   assert.equal(statusExtensionForProfile("unknown"), undefined);
 });
 
-test("entrypoint registers only the selected profile handlers", () => {
+test("entrypoint always registers the watchdog and only the selected status handlers", () => {
   const previous = process.env.AGENT_ORCHESTRATION_PROFILE;
   try {
     for (const [profile, expected] of [
-      ["hybrid", ["session_start", "session_shutdown"]],
-      ["deepseek", ["session_start", "session_shutdown"]],
-      ["openai", ["session_start", "model_select", "session_shutdown"]],
-      ["glm", ["session_start", "session_shutdown"]],
-      ["unknown", []],
+      ["hybrid", ["session_shutdown", "session_start", "session_shutdown"]],
+      ["deepseek", ["session_shutdown", "session_start", "session_shutdown"]],
+      ["openai", ["session_shutdown", "session_start", "model_select", "session_shutdown"]],
+      ["glm", ["session_shutdown", "session_start", "session_shutdown"]],
+      ["unknown", ["session_shutdown"]],
+      [undefined, ["session_shutdown"]],
     ]) {
-      process.env.AGENT_ORCHESTRATION_PROFILE = profile;
+      if (profile === undefined) delete process.env.AGENT_ORCHESTRATION_PROFILE;
+      else process.env.AGENT_ORCHESTRATION_PROFILE = profile;
       const events = [];
-      harnessStatusExtension({ on(name) { events.push(name); } });
+      const handlers = [];
+      const busEvents = [];
+      harnessStatusExtension({
+        events: {
+          on(name) {
+            busEvents.push(name);
+            return () => {};
+          },
+        },
+        on(name, handler) {
+          events.push(name);
+          handlers.push(handler);
+        },
+      });
       assert.deepEqual(events, expected, profile);
+      assert.deepEqual(busEvents, [
+        "subagents:started",
+        "subagents:completed",
+        "subagents:failed",
+      ], profile);
+      handlers[0]();
     }
   } finally {
     if (previous === undefined) delete process.env.AGENT_ORCHESTRATION_PROFILE;
