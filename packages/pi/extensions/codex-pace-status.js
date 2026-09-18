@@ -1,10 +1,10 @@
-import { join } from "node:path";
-import { pathToFileURL } from "node:url";
-import { readFileSync } from "node:fs";
-
 const STATUS_KEY = "agent-orchestration-codex-pace";
+const CODEX_PROVIDER = "openai-codex";
+const CODEX_ORIGIN = "https://chatgpt.com";
+const CODEX_USAGE_URL = `${CODEX_ORIGIN}/backend-api/wham/usage`;
 const REFRESH_MS = 5 * 60 * 1000;
 const QUERY_TIMEOUT_MS = 15_000;
+const MAX_RESPONSE_BYTES = 64 * 1024;
 const WEEK_MINUTES = 7 * 24 * 60;
 const MIN_WEEK_MINUTES = 6 * 24 * 60;
 const MAX_WEEK_MINUTES = 8 * 24 * 60;
@@ -14,13 +14,43 @@ function finiteNumber(value) {
   return typeof value === "number" && Number.isFinite(value);
 }
 
+function asObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : undefined;
+}
+
+function asNumber(value) {
+  if (finiteNumber(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+function hasOfficialCodexOrigin(value) {
+  if (typeof value !== "string") return false;
+  try {
+    return new URL(value).origin === CODEX_ORIGIN;
+  } catch {
+    return false;
+  }
+}
+
+function headerValue(headers, name) {
+  const expected = name.toLowerCase();
+  for (const [key, value] of Object.entries(headers ?? {})) {
+    if (key.toLowerCase() === expected && typeof value === "string" && value) return value;
+  }
+  return undefined;
+}
+
 function signedPercentPoints(value) {
   const rounded = Math.round(value);
   return `${rounded >= 0 ? "+" : ""}${Object.is(rounded, -0) ? 0 : rounded}pp`;
 }
 
 export function codexWeeklyPace(report, now = Date.now()) {
-  if (!report || report.providerId !== "openai-codex" || !Array.isArray(report.buckets)) return null;
+  if (!report || report.providerId !== CODEX_PROVIDER || !Array.isArray(report.buckets)) return null;
   if (!finiteNumber(report.capturedAt) || report.capturedAt > now + 60_000) return null;
   if (now - report.capturedAt > MAX_REPORT_AGE_MS) return null;
 
@@ -45,40 +75,104 @@ export function codexWeeklyPace(report, now = Date.now()) {
   return `pace ${signedPercentPoints(ahead)} · proj ${projection}`;
 }
 
-export function resolvePiUsageEntrypoint(root) {
-  const settings = JSON.parse(readFileSync(join(root, "settings.json"), "utf8"));
-  if (!Array.isArray(settings.packages)) throw new Error("Pi packages are unavailable");
-  for (const entry of settings.packages) {
-    const source = typeof entry === "string" ? entry : entry?.source;
-    if (typeof source !== "string" || !source.startsWith("/")) continue;
-    try {
-      const manifest = JSON.parse(readFileSync(join(source, "package.json"), "utf8"));
-      if (manifest.name === "@narumitw/pi-usage") {
-        return pathToFileURL(join(source, "dist", "index.ts")).href;
-      }
-    } catch {
-      // Ignore unrelated malformed package entries and fail closed below.
-    }
+export function normalizeCodexUsage(payload, capturedAt = Date.now()) {
+  const root = asObject(payload);
+  const rateLimit = asObject(root?.rate_limit);
+  const buckets = [];
+  for (const [position, raw] of [
+    ["primary", rateLimit?.primary_window],
+    ["secondary", rateLimit?.secondary_window],
+  ]) {
+    const window = asObject(raw);
+    const used = asNumber(window?.used_percent);
+    if (used === undefined) continue;
+    const seconds = asNumber(window?.limit_window_seconds);
+    const resetsAt = asNumber(window?.reset_at);
+    buckets.push({
+      id: `codex:${position}`,
+      unit: "percent",
+      used,
+      ...(seconds !== undefined && seconds > 0
+        ? { windowMinutes: Math.ceil(seconds / 60) }
+        : {}),
+      ...(resetsAt !== undefined ? { resetsAt } : {}),
+    });
   }
-  throw new Error("Configured pi-usage package is unavailable");
+  return { providerId: CODEX_PROVIDER, capturedAt, buckets };
 }
 
-async function loadUsageApi() {
-  const root = process.env.PI_CODING_AGENT_DIR;
-  if (!root) throw new Error("Pi profile root is unavailable");
-  return import(resolvePiUsageEntrypoint(root));
+async function readBoundedJson(response) {
+  if (response.redirected) throw new Error("Codex usage redirected");
+  if (!response.ok) throw new Error("Codex usage request failed");
+  const declared = Number(response.headers?.get?.("content-length"));
+  if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
+    throw new Error("Codex usage response too large");
+  }
+  const text = await response.text();
+  if (Buffer.byteLength(text, "utf8") > MAX_RESPONSE_BYTES) {
+    throw new Error("Codex usage response too large");
+  }
+  const payload = JSON.parse(text);
+  if (!asObject(payload)) throw new Error("Codex usage response malformed");
+  return payload;
+}
+
+export async function queryCodexUsage(ctx, signal, dependencies = {}) {
+  if (ctx.model?.provider !== CODEX_PROVIDER || !hasOfficialCodexOrigin(ctx.model.baseUrl)) {
+    throw new Error("Official Codex model required");
+  }
+  const registry = ctx.modelRegistry;
+  const provider = registry.getProvider(CODEX_PROVIDER);
+  if (provider?.baseUrl && !hasOfficialCodexOrigin(provider.baseUrl)) {
+    throw new Error("Official Codex provider required");
+  }
+  const resolved = await registry.getProviderAuth(CODEX_PROVIDER);
+  const auth = resolved?.auth;
+  if (!auth) throw new Error("Codex usage auth unavailable");
+  if (auth.baseUrl && !hasOfficialCodexOrigin(auth.baseUrl)) {
+    throw new Error("Official Codex auth origin required");
+  }
+
+  const headers = { Accept: "application/json" };
+  for (const [key, value] of Object.entries(auth.headers ?? {})) {
+    if (typeof value === "string") headers[key] = value;
+  }
+  if (!headerValue(headers, "authorization")) {
+    if (typeof auth.apiKey !== "string" || !auth.apiKey) {
+      throw new Error("Codex usage authorization unavailable");
+    }
+    headers.Authorization = `Bearer ${auth.apiKey}`;
+  }
+
+  const requestController = new AbortController();
+  const abortFromParent = () => requestController.abort(signal.reason);
+  if (signal.aborted) abortFromParent();
+  else signal.addEventListener("abort", abortFromParent, { once: true });
+  const timeout = (dependencies.setTimeout ?? setTimeout)(
+    () => requestController.abort(),
+    dependencies.timeoutMs ?? QUERY_TIMEOUT_MS,
+  );
+  try {
+    const response = await (dependencies.fetch ?? fetch)(CODEX_USAGE_URL, {
+      method: "GET",
+      headers,
+      redirect: "error",
+      signal: requestController.signal,
+    });
+    return normalizeCodexUsage(
+      await readBoundedJson(response),
+      (dependencies.now ?? Date.now)(),
+    );
+  } finally {
+    (dependencies.clearTimeout ?? clearTimeout)(timeout);
+    signal.removeEventListener("abort", abortFromParent);
+  }
 }
 
 export default function codexPaceStatus(pi, dependencies = {}) {
   const now = dependencies.now ?? Date.now;
   const schedule = dependencies.setInterval ?? setInterval;
   const unschedule = dependencies.clearInterval ?? clearInterval;
-  let usageApiPromise;
-  const getUsageApi = () => {
-    if (dependencies.usageApi) return Promise.resolve(dependencies.usageApi);
-    usageApiPromise ??= loadUsageApi();
-    return usageApiPromise;
-  };
   let timer;
   let controller;
   let generation = 0;
@@ -101,24 +195,24 @@ export default function codexPaceStatus(pi, dependencies = {}) {
   const refresh = async (ctx, model = ctx.model) => {
     const currentGeneration = ++generation;
     controller?.abort();
-    controller = new AbortController();
-    if (model?.provider !== "openai-codex") {
+    const requestController = new AbortController();
+    controller = requestController;
+    if (model?.provider !== CODEX_PROVIDER) {
       publish(ctx, undefined);
       return;
     }
     try {
-      const usageApi = await getUsageApi();
-      const adapter = usageApi.adapterForProvider("openai-codex");
-      if (!adapter) throw new Error("Codex usage adapter unavailable");
-      const auth = await usageApi.resolveUsageAuth(ctx, adapter);
-      if (!auth) throw new Error("Codex usage auth unavailable");
-      const report = await usageApi.queryProviderUsage(
-        adapter, auth, controller.signal, QUERY_TIMEOUT_MS,
-      );
-      if (currentGeneration !== generation || controller.signal.aborted) return;
+      const report = await queryCodexUsage(ctx, requestController.signal, {
+        fetch: dependencies.fetch,
+        now,
+        setTimeout: dependencies.setTimeout,
+        clearTimeout: dependencies.clearTimeout,
+        timeoutMs: dependencies.timeoutMs,
+      });
+      if (currentGeneration !== generation || requestController.signal.aborted) return;
       publish(ctx, codexWeeklyPace(report, now()) ?? "pace unavailable");
     } catch {
-      if (currentGeneration === generation && !controller?.signal.aborted) {
+      if (currentGeneration === generation && !requestController.signal.aborted) {
         publish(ctx, "pace unavailable");
       }
     }

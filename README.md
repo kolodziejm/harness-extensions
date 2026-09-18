@@ -12,7 +12,7 @@ The root is an installable Pi package. It currently provides one profile-selecte
 | --- | --- |
 | `hybrid` | DeepSeek weekday UTC price period |
 | `deepseek` | DeepSeek weekday UTC price period |
-| `openai` | Codex weekly usage pace via `@narumitw/pi-usage` |
+| `openai` | Codex weekly usage pace via Pi's resolved provider authentication |
 | `glm` | GLM-5.3 weekday UTC price period |
 
 Unknown or missing profiles register no status handlers. The package does not modify authentication, settings, model routing, prompts, agents, or permissions.
@@ -31,7 +31,7 @@ pi install /absolute/path/to/harness-extensions
 
 Profile launchers supplied by `agent-orchestration` set `AGENT_ORCHESTRATION_PROFILE`. Install the package separately in each isolated Pi profile that should display status UI, then restart Pi.
 
-The OpenAI pace integration expects `@narumitw/pi-usage` to already be configured in the active Pi profile. Missing, stale, invalid, or failed usage data is shown as `pace unavailable`; credentials and provider error bodies are never displayed or persisted.
+The OpenAI pace integration reads resolved OpenAI Codex authentication through Pi's documented `ctx.modelRegistry` API and queries only the official `https://chatgpt.com` usage endpoint. It does not require `@narumitw/pi-usage`, read credential files, or modify authentication. Custom provider origins fail closed before any credential is sent. Missing, stale, invalid, or failed usage data is shown as `pace unavailable`; credentials and provider response bodies are never displayed or persisted.
 
 ## Development
 

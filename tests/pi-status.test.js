@@ -1,15 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import test from "node:test";
 
 import harnessStatusExtension, {
   statusExtensionForProfile,
 } from "../packages/pi/index.js";
-import {
+import codexPaceStatus, {
   codexWeeklyPace,
-  resolvePiUsageEntrypoint,
+  normalizeCodexUsage,
 } from "../packages/pi/extensions/codex-pace-status.js";
 import {
   deepseekPricePeriod,
@@ -104,17 +101,199 @@ test("Codex weekly pace accepts a current seven-day bucket and rejects stale dat
   assert.equal(codexWeeklyPace({ ...valid, buckets: [] }, now), null);
 });
 
-test("Codex usage integration resolves only a configured pi-usage package", () => {
-  const root = mkdtempSync(join(tmpdir(), "harness-extensions-"));
-  const packageRoot = join(root, "shared", "@narumitw", "pi-usage");
-  const profileRoot = join(root, "profile");
-  mkdirSync(join(packageRoot, "dist"), { recursive: true });
-  mkdirSync(profileRoot);
-  writeFileSync(join(packageRoot, "package.json"), JSON.stringify({ name: "@narumitw/pi-usage" }));
-  writeFileSync(join(packageRoot, "dist", "index.ts"), "export {};\n");
-  writeFileSync(join(profileRoot, "settings.json"), JSON.stringify({ packages: [packageRoot] }));
-  assert.equal(
-    resolvePiUsageEntrypoint(profileRoot),
-    new URL(`file://${join(packageRoot, "dist", "index.ts")}`).href,
-  );
+function codexContext(overrides = {}) {
+  const statuses = [];
+  const auth = overrides.auth === undefined
+    ? { apiKey: "test-token", baseUrl: "https://chatgpt.com/backend-api" }
+    : overrides.auth;
+  return {
+    statuses,
+    context: {
+      model: overrides.model ?? {
+        provider: "openai-codex",
+        baseUrl: "https://chatgpt.com/backend-api/codex",
+      },
+      modelRegistry: {
+        getProvider() {
+          return overrides.provider ?? { baseUrl: "https://chatgpt.com/backend-api" };
+        },
+        async getProviderAuth() {
+          return auth ? { auth } : undefined;
+        },
+      },
+      ui: {
+        setStatus(key, value) {
+          statuses.push([key, value]);
+        },
+      },
+    },
+  };
+}
+
+function codexHandlers(dependencies) {
+  const handlers = new Map();
+  codexPaceStatus({ on(name, handler) { handlers.set(name, handler); } }, {
+    setInterval() { return { unref() {} }; },
+    clearInterval() {},
+    ...dependencies,
+  });
+  return handlers;
+}
+
+function usageResponse(payload, status = 200) {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+const WEEKLY_PAYLOAD = {
+  rate_limit: {
+    primary_window: {
+      used_percent: "60",
+      limit_window_seconds: String(7 * 24 * 60 * 60),
+      reset_at: String((1_800_000_000_000 + 3.5 * 24 * 60 * 60 * 1000) / 1000),
+    },
+  },
+};
+
+test("Codex usage normalization accepts numeric strings", () => {
+  const report = normalizeCodexUsage(WEEKLY_PAYLOAD, 1_800_000_000_000);
+  assert.equal(codexWeeklyPace(report, 1_800_000_000_000), "pace +10pp · proj 120%");
+});
+
+test("Codex pace reads resolved official auth and publishes weekly pace", async () => {
+  const { context, statuses } = codexContext();
+  let requested;
+  const handlers = codexHandlers({
+    now: () => 1_800_000_000_000,
+    async fetch(url, options) {
+      requested = { url, options };
+      return usageResponse(WEEKLY_PAYLOAD);
+    },
+  });
+
+  await handlers.get("session_start")({}, context);
+
+  assert.equal(requested.url, "https://chatgpt.com/backend-api/wham/usage");
+  assert.equal(requested.options.method, "GET");
+  assert.equal(requested.options.redirect, "error");
+  assert.equal(requested.options.headers.Authorization.startsWith("Bearer "), true);
+  assert.deepEqual(statuses.at(-1), [
+    "agent-orchestration-codex-pace",
+    "pace +10pp · proj 120%",
+  ]);
+});
+
+test("Codex pace fails closed on custom credential origins", async () => {
+  const cases = [
+    { model: { provider: "openai-codex", baseUrl: "https://proxy.invalid" } },
+    { provider: { baseUrl: "https://proxy.invalid" } },
+    { auth: { apiKey: "test-token", baseUrl: "https://proxy.invalid" } },
+  ];
+  for (const overrides of cases) {
+    const { context, statuses } = codexContext(overrides);
+    let fetchCalls = 0;
+    const handlers = codexHandlers({
+      async fetch() {
+        fetchCalls += 1;
+        return usageResponse(WEEKLY_PAYLOAD);
+      },
+    });
+    await handlers.get("session_start")({}, context);
+    assert.equal(fetchCalls, 0);
+    assert.equal(statuses.at(-1)?.[1], "pace unavailable");
+  }
+});
+
+test("Codex pace degrades safely for missing auth, HTTP errors, and malformed data", async () => {
+  const cases = [
+    { auth: null, fetch: async () => usageResponse(WEEKLY_PAYLOAD) },
+    { fetch: async () => usageResponse({ message: "sensitive" }, 401) },
+    { fetch: async () => usageResponse({ rate_limit: {} }) },
+  ];
+  for (const item of cases) {
+    const { context, statuses } = codexContext({ auth: item.auth });
+    const handlers = codexHandlers({ fetch: item.fetch });
+    await handlers.get("session_start")({}, context);
+    assert.equal(statuses.at(-1)?.[1], "pace unavailable");
+  }
+});
+
+test("Codex pace preserves resolved string headers and existing authorization", async () => {
+  const { context } = codexContext({
+    auth: {
+      apiKey: "unused-token",
+      headers: {
+        authorization: "Bearer resolved-token",
+        "ChatGPT-Account-Id": "account-id",
+        "X-Ignored": null,
+      },
+      baseUrl: "https://chatgpt.com/backend-api",
+    },
+  });
+  let requestHeaders;
+  const handlers = codexHandlers({
+    now: () => 1_800_000_000_000,
+    async fetch(_url, options) {
+      requestHeaders = options.headers;
+      return usageResponse(WEEKLY_PAYLOAD);
+    },
+  });
+  await handlers.get("session_start")({}, context);
+  assert.equal(requestHeaders.authorization.startsWith("Bearer "), true);
+  assert.equal(requestHeaders.Authorization, undefined);
+  assert.equal(requestHeaders["ChatGPT-Account-Id"], "account-id");
+  assert.equal(requestHeaders["X-Ignored"], undefined);
+});
+
+test("Codex pace bounds responses and enforces the request timeout", async () => {
+  for (const dependencies of [
+    {
+      setTimeout(callback) {
+        callback();
+        return 1;
+      },
+      clearTimeout() {},
+      async fetch(_url, options) {
+        assert.equal(options.signal.aborted, true);
+        throw new Error("aborted");
+      },
+    },
+    {
+      async fetch() {
+        return usageResponse({ padding: "x".repeat(65 * 1024) });
+      },
+    },
+  ]) {
+    const { context, statuses } = codexContext();
+    const handlers = codexHandlers(dependencies);
+    await handlers.get("session_start")({}, context);
+    assert.equal(statuses.at(-1)?.[1], "pace unavailable");
+  }
+});
+
+test("Codex pace shutdown aborts an in-flight request without unhandled rejection", async () => {
+  const { context, statuses } = codexContext();
+  const unhandled = [];
+  const listener = (error) => unhandled.push(error);
+  process.on("unhandledRejection", listener);
+  try {
+    const handlers = codexHandlers({
+      fetch(_url, options) {
+        return new Promise((_resolve, reject) => {
+          options.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        });
+      },
+    });
+    const starting = handlers.get("session_start")({}, context);
+    await Promise.resolve();
+    handlers.get("session_shutdown")({}, context);
+    await starting;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(unhandled.length, 0);
+    assert.deepEqual(statuses.at(-1), ["agent-orchestration-codex-pace", undefined]);
+  } finally {
+    process.off("unhandledRejection", listener);
+  }
 });
