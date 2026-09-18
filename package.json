@@ -4,6 +4,11 @@
   "private": true,
   "type": "module",
   "description": "Optional runtime extensions for agent harnesses",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kolodziejm/harness-extensions.git"
+  },
+  "homepage": "https://github.com/kolodziejm/harness-extensions#readme",
   "keywords": [
     "pi-package",
     "agent-harness",
